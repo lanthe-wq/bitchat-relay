@@ -249,8 +249,6 @@ Key facts encoded in the sketch:
 - [h2zero/NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) — the BLE stack that makes simultaneous central+peripheral practical on ESP32.
 - [dearabhin/bitchat-cli](https://github.com/dearabhin/bitchat-cli) — independent Python implementation, useful as a second reference for the wire format.
 
-## License
 
-MIT — see [`LICENSE`](LICENSE).
 
 *(Pick whatever suits you. Note that upstream bitchat is Unlicense/public domain on iOS and MIT on Android; MIT here keeps things simple and compatible.)*
