@@ -12,10 +12,12 @@ bitchat phones relay for each other, but phones move, sleep, and run out of batt
 
 - [How it works](#how-it-works)
 - [What it deliberately doesn't do](#what-it-deliberately-doesnt-do)
+- [Repository layout](#repository-layout)
 - [Hardware](#hardware)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Verifying it works](#verifying-it-works)
+- [Host checks](#host-checks)
 - [Reading the serial log](#reading-the-serial-log)
 - [Troubleshooting](#troubleshooting)
 - [Protocol notes](#protocol-notes)
@@ -59,6 +61,24 @@ A relay is a dumb pipe. This one does **not**:
 - **Reassemble fragments.** Each fragment is relayed as its own packet.
 
 This is a security property, not a shortcut. A compromised or buggy relay can drop your traffic, but it cannot read it.
+
+## Repository layout
+
+```
+bitchat_relay.ino    the sketch — BLE plumbing, config at the top
+relay_core.h         packet decision: header parsing, dedup, TTL policy
+test/                host checks, no ESP32 required
+AUDIT.md             code audit findings and what changed
+```
+
+Arduino IDE compiles `relay_core.h` automatically as long as it sits next to the
+`.ino`. There is nothing extra to configure.
+
+The split exists because a relay fails *silently*. A wrong byte offset or an
+off-by-one in the dedup cache doesn't crash — it quietly drops or mangles
+traffic, and you find out when you need the mesh. Keeping that logic free of BLE
+types means it can be run against known-good and deliberately malformed packets
+on a laptop.
 
 ## Hardware
 
@@ -136,24 +156,36 @@ A healthy boot:
 === bitchat relay booting ===
 [srv ] advertising as bitchat peer
 [scan] scanning for bitchat peers
-[stat] links=0  heap=213...
+[stat] links=0  outbound=0  heap=213...
 ```
 
 `links=0` is correct at this point — there's nothing to talk to yet.
 
 ## Configuration
 
-All at the top of `bitchat_relay.ino`:
+At the top of `bitchat_relay.ino`:
 
 | Constant | Default | Purpose |
 |---|---|---|
 | `BITCHAT_SERVICE_UUID` | `F47B5E2D-…-8E1D2C3A4B5C` | **Production** mesh. Testnet ends `…4B5A`. Mixing them means you'll never see real peers. |
 | `BITCHAT_CHAR_UUID` | `A1B2C3D4-…-0E1F2A3B4C5D` | Message transfer characteristic. |
-| `DEVICE_NAME` | `bitchat-relay` | Advertised name. |
+| `DEVICE_NAME` | `bitchat-relay` | Advertised name. Goes in the scan response, so the service UUID keeps its place in the advertisement itself. |
 | `TX_POWER_DBM` | `9` | Max on most ESP32s. NimBLE 2.x takes plain dBm, **not** `ESP_PWR_LVL_*`. |
-| `DESIRED_MTU` | `517` | Gives a 512-byte payload, matching bitchat's max. |
+| `DESIRED_MTU` | `517` | Gives a 512-byte payload, matching bitchat's max. A *preference* — links that negotiate less are skipped for packets they can't carry intact, rather than being sent a truncated one. |
 | `STRICT_HEADER_LOGGING` | `1` | Dumps raw header bytes. **Leave on for bring-up, turn off for deployment.** |
+| `LOG_DROPS` | `1` | Logs every packet not forwarded, and why. Cheap — leave it on. Without it, a relay dropping everything looks exactly like a quiet mesh. |
+| `STRICT_LENGTH_CHECK` | `1` | Rejects frames whose declared `payloadLen` can't fit in the frame received. Set to `0` only if a protocol change makes it over-strict. |
+| `DEDUP_CACHE_SIZE` | `256` | Seen-packet ring. The real client keeps 1000; raise this if `[stat]` shows heap to spare and you see duplicates re-forwarded. |
+| `SCAN_INTERVAL_MS` / `SCAN_WINDOW_MS` | `160` / `64` | 40 % scan duty cycle. The radio is shared with every live connection — scanning harder is what makes a relay drop the links it already has. |
+| `FAILURE_BACKOFF_MS` | `60000` | How long to leave a peer alone after a failed connect, so a device advertising the UUID without the service can't pin the relay in a retry loop. |
+
+Wire-format constants and the relay policy live in `relay_core.h`:
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `OFF_*`, `V1_HEADER_SIZE`, `SENDER_ID_SIZE` | — | Packet layout. Change these if the app's header changes. |
 | `DENSE_LINK_THRESHOLD` / `DENSE_TTL_CAP` | `6` / `5` | Simplified version of the real client's density-based TTL clamping. |
+| `DEDUP_WINDOW_MS` | `300000` | 5 minutes, matching the client. |
 
 ## Verifying it works
 
@@ -165,19 +197,42 @@ With `STRICT_HEADER_LOGGING 1`, stand next to the relay with bitchat open on a p
 [srv ] peer connected to us, handle=1
 [link] + handle=1 role=peripheral  (total 1)
 [srv ] MTU now 517 on handle 1
+[srv ] handle=1 notifications on
 [rx  ] handle=1 len=76 hdr=01 04 07 00 00 01 93 6F ...  | ver=1 type=4 ttl=7
 [relay] forwarded 76 byte packet to 0 link(s)
 ```
 
-Check three things:
+Check four things:
 
 - **`ver=1`** — protocol version parsed correctly. Something like `147` means your offsets are wrong.
 - **`ttl=7`** — fresh packets start at 7. Values of 7/6/5 are all plausible; 200+ means byte 2 is being misread.
+- **`notifications on`** — the phone subscribed, so the relay has somewhere to deliver. Without this line the link can only receive, not send.
 - **`forwarded … to 0 link(s)`** — correct with one phone. There's nowhere else to send it.
 
 **The real test:** two phones, separated until they can't see each other directly, relay in between. If they can now exchange messages and the log shows `forwarded … to 1 link(s)`, it works.
 
-Then set `STRICT_HEADER_LOGGING 0` and re-flash — it's chatty and slows things under load.
+Then set `STRICT_HEADER_LOGGING 0` and re-flash — it's chatty and slows things under load. Leave `LOG_DROPS 1`: it's cheap, and it's the difference between a quiet mesh and a relay silently dropping everything.
+
+## Host checks
+
+Two checks run on any machine with `g++` and `make` — no board, no BLE stack:
+
+```
+cd test && make check
+```
+
+- **`make compile-check`** type-checks the sketch against stub headers that
+  mirror the real NimBLE-Arduino 2.3.6 signatures. This catches the 1.x/2.x API
+  drift that produces the compiler error wall described above, without waiting
+  on the ESP32 toolchain.
+- **`make run`** runs 57 checks over the packet decision logic: header parsing,
+  the dedup window and its behaviour across the `millis()` rollover, TTL and
+  density clamping, malformed and hostile frames, and a two-relay loop
+  containment model.
+
+Neither says anything about radio behaviour. They're a fast way to know you
+haven't broken the parsing or the relay policy — the on-hardware verification
+above is still mandatory.
 
 ## Reading the serial log
 
@@ -189,7 +244,27 @@ Then set `STRICT_HEADER_LOGGING 0` and re-flash — it's chatty and slows things
 | `[link]` | Connection added to / removed from the link table |
 | `[rx  ]` | Raw packet arrived (header logging only) |
 | `[relay]` | Packet decremented and passed on |
-| `[stat]` | 15-second heartbeat: link count and free heap |
+| `[drop ]` | Packet **not** forwarded, with the reason (see below) |
+| `[warn ]` | Frame length doesn't match its declared `payloadLen` — suspect the offsets have drifted from the app |
+| `[stat]` | 15-second heartbeat: link count, outbound connections, free heap |
+
+`[relay]` lines carry counters when something didn't go out cleanly:
+
+| Counter | Meaning |
+|---|---|
+| `failed=N` | The BLE stack refused the send. Usually congestion. |
+| `skipped-mtu=N` | That link's negotiated MTU is too small to carry the packet intact. Normal for a second or two after a peer connects, while MTU exchange completes. Persistent means a peer that won't negotiate up. |
+| `skipped-unsubscribed=N` | A phone is connected but hasn't enabled notifications, so there's nowhere to deliver. |
+
+`[drop ]` reasons, worst-first:
+
+| Reason | Meaning |
+|---|---|
+| `bad-version` | Not a v1 packet. Byte 2 may not be TTL, so the relay won't touch it. Expect this after a protocol change — re-verify your offsets. |
+| `short-payload` | Declared `payloadLen` doesn't fit in the bytes received. Truncated or misparsed. |
+| `too-short` / `oversized` | Below 22 bytes or above 512. Not a valid bitchat frame. |
+| `ttl-exhausted` | Would arrive dead. Normal and healthy. |
+| `duplicate` | Already relayed. The common case in a working mesh, so it is **not** logged. |
 
 ## Troubleshooting
 
@@ -202,9 +277,12 @@ Then set `STRICT_HEADER_LOGGING 0` and re-flash — it's chatty and slows things
 | Boots fine, `links=0` forever | No peers in range — usually the answer | Stand next to it with the app open and foregrounded |
 | `links=0` with a phone right there | Wrong service UUID, or protocol changed | Confirm UUID ends `…4B5C`; cross-check `BLEService.swift` |
 | `no free client slots` | Connection limit still 3 | Redo the `nimconfig.h` step, restart IDE |
-| Connects then drops repeatedly | Weak signal, or supply browning out on TX | Test closer; try a better 5V supply |
-| `ver`/`ttl` are nonsense | Byte offsets no longer match the app | Check `BinaryProtocol.swift` upstream, update `OFF_*` constants |
-| Heap falls steadily | Leak from repeated failed connections | Power-cycle; raise scan interval if it recurs |
+| Connects then drops repeatedly | Weak signal, supply browning out on TX, or scanning too hard | Test closer; try a better 5V supply; raise `SCAN_INTERVAL_MS` |
+| `ver`/`ttl` are nonsense | Byte offsets no longer match the app | Check `BinaryProtocol.swift` upstream, update `OFF_*` in `relay_core.h` |
+| Heap falls steadily | Fragmentation, or genuinely too many peers | Was a client leak before the audit — see `AUDIT.md` S1. If it recurs, capture the `[stat]` trend and the `[drop ]` reasons before power-cycling. |
+| `[drop ] reason=bad-version` on everything | The app moved to a new protocol version | The relay is refusing to corrupt packets it can't parse. Re-verify offsets against `BinaryProtocol.swift`. |
+| `[relay] ... skipped-mtu=N` persists | A peer won't negotiate a larger MTU | Nothing to do at the relay end; that link can only carry short frames. |
+| `[relay] ... to 0 link(s)` with 2+ links | Peers connected but not subscribed | Check for `skipped-unsubscribed=N` on the same line. |
 
 ## Protocol notes
 
